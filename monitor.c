@@ -1559,7 +1559,7 @@ static bool ptiter_init(Monitor *mon, PTIter *it)
         {"PML4", "PDP", "PDE", "PTE"}, 12, 13
     };
 #endif
-    CPUState *env;
+    CPUArchState *env;
 
     env = mon_get_cpu();
 
@@ -2047,6 +2047,172 @@ static void hmp_info_mem(Monitor *mon, const QDict *qdict)
         }
     } else {
         mem_info_32(mon, env);
+    }
+}
+
+/* Return true if the page tree rooted at iter is complete and
+ * compatible with compat.  last will be filled with the last entry at
+ * each level.  If false, does not change iter and last can be filled
+ * with anything; if true, returns with iter at the next entry on the
+ * same level, or the next parent entry if iter is on the last entry
+ * of this level. */
+static bool pg_complete(PTIter *root, const PTIter compat[], PTIter last[])
+{
+    PTIter iter = *root;
+
+    if ((root->ent & 0xfff) != (compat[root->level].ent & 0xfff)) {
+        return false;
+    }
+
+    last[root->level] = *root;
+    ptiter_succ(&iter);
+    if (!root->leaf) {
+        /* Are all of the direct children of root complete? */
+        while (iter.level == root->level + 1) {
+            if (!pg_complete(&iter, compat, last)) {
+                return false;
+            }
+        }
+    }
+    assert(iter.level <= root->level);
+    assert(iter.level == root->level ?
+           iter.i[iter.level] == root->i[iter.level] + 1 : 1);
+    *root = iter;
+    return true;
+}
+
+static char *pg_bits(uint64_t ent)
+{
+    static char buf[32];
+    sprintf(buf, "%c%c%c%c%c%c%c%c%c%c",
+            /* TODO: Some of these change depending on level */
+            ent & PG_NX_MASK ? 'X' : '-',
+            ent & PG_GLOBAL_MASK ? 'G' : '-',
+            ent & PG_PSE_MASK ? 'S' : '-',
+            ent & PG_DIRTY_MASK ? 'D' : '-',
+            ent & PG_ACCESSED_MASK ? 'A' : '-',
+            ent & PG_PCD_MASK ? 'C' : '-',
+            ent & PG_PWT_MASK ? 'T' : '-',
+            ent & PG_USER_MASK ? 'U' : '-',
+            ent & PG_RW_MASK ? 'W' : '-',
+            ent & PG_PRESENT_MASK ? 'P' : '-');
+    return buf;
+}
+
+static void pg_print(Monitor *mon, PTIter *s, PTIter *l)
+{
+    int lev = s->level;
+    char buf[128];
+    char *pos = buf, *end = buf + sizeof(buf);
+
+    /* VFN range */
+    pos += sprintf(pos, "%*s[%0*"PRIx64"-%0*"PRIx64"] ",
+                   lev*2, "",
+                   s->layout->vaw - 3, (uint64_t)s->va >> 12,
+                   s->layout->vaw - 3, ((uint64_t)l->va + l->size - 1) >> 12);
+
+    /* Slot */
+    if (s->i[lev] == l->i[lev]) {
+        pos += sprintf(pos, "%4s[%03x]    ",
+                       s->layout->names[lev], s->i[lev]);
+    } else {
+        pos += sprintf(pos, "%4s[%03x-%03x]",
+                       s->layout->names[lev], s->i[lev], l->i[lev]);
+    }
+
+    /* Flags */
+    pos += sprintf(pos, " %s", pg_bits(s->ent));
+
+    /* Range-compressed PFN's */
+    if (s->leaf) {
+        PTIter iter = *s;
+        int i = 0;
+        bool exhausted = false;
+        while (!exhausted && i++ < 10) {
+            hwaddr pas = iter.pa, pae = iter.pa + iter.size;
+            while (ptiter_succ(&iter) && iter.va <= l->va) {
+                if (iter.level == s->level) {
+                    if (iter.pa == pae) {
+                        pae = iter.pa + iter.size;
+                    } else {
+                        goto print;
+                    }
+                }
+            }
+            exhausted = true;
+
+print:
+            if (pas >> 12 == (pae - 1) >> 12) {
+                pos += snprintf(pos, end-pos, " %0*"PRIx64,
+                                s->layout->paw - 3, (uint64_t)pas >> 12);
+            } else {
+                pos += snprintf(pos, end-pos, " %0*"PRIx64"-%0*"PRIx64,
+                                s->layout->paw - 3, (uint64_t)pas >> 12,
+                                s->layout->paw - 3, (uint64_t)(pae - 1) >> 12);
+            }
+            pos = MIN(pos, end);
+        }
+    }
+
+    /* Trim line to fit screen */
+    if (pos - buf > 79) {
+        strcpy(buf + 77, "..");
+    }
+
+    monitor_printf(mon, "%s\n", buf);
+}
+
+static void pg_info(Monitor *mon, const QDict *qdict)
+{
+    PTIter iter;
+
+    if (!ptiter_init(mon, &iter)) {
+        return;
+    }
+
+    /* Header line */
+    monitor_printf(mon, "%-*s %-13s %-10s %*s%s\n",
+                   3 + 2 * (iter.layout->vaw-3), "VPN range",
+                   "Entry", "Flags",
+                   2*(iter.layout->levels-1), "", "Physical page");
+
+    while (iter.level >= 0) {
+        int i, startLevel, maxLevel;
+        PTIter start[4], last[4], nlast[4];
+        bool compressed = false;
+
+        /* Skip to the next present entry */
+        do { } while (!iter.present && ptiter_succ(&iter));
+        if (iter.level < 0) {
+            break;
+        }
+
+        /* Find a run of complete entries starting at iter and staying
+         * on the same level. */
+        startLevel = iter.level;
+        memset(start, 0, sizeof(start));
+        do {
+            start[iter.level] = iter;
+        } while (!iter.leaf && ptiter_succ(&iter));
+        maxLevel = iter.level;
+        iter = start[startLevel];
+        while (iter.level == startLevel && pg_complete(&iter, start, nlast)) {
+            compressed = true;
+            memcpy(last, nlast, sizeof(last));
+        }
+
+        if (compressed) {
+            /* We found a run we can show as a range spanning
+             * [startLevel, maxLevel].  start stores the first entry
+             * at each level and last stores the last entry. */
+            for (i = startLevel; i <= maxLevel; i++) {
+                pg_print(mon, &start[i], &last[i]);
+            }
+        } else {
+            /* No luck finding a range.  Iter hasn't moved. */
+            pg_print(mon, &iter, &iter);
+            ptiter_succ(&iter);
+        }
     }
 }
 #endif
@@ -2859,6 +3025,13 @@ static mon_cmd_t info_cmds[] = {
         .params     = "",
         .help       = "show the active virtual memory mappings",
         .mhandler.cmd = hmp_info_mem,
+    },
+    {
+        .name       = "pg",
+        .args_type  = "",
+        .params     = "",
+        .help       = "show the page table",
+        .mhandler.cmd = pg_info,
     },
 #endif
     {
