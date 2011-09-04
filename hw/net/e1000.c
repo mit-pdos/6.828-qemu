@@ -34,17 +34,29 @@
 #include "sysemu/dma.h"
 #include "qemu/iov.h"
 #include "qemu/range.h"
+#include "qapi/qmp/qerror.h"
 
 #include "e1000_regs.h"
 
 #define E1000_DEBUG
 
 #ifdef E1000_DEBUG
+#define E1000_FOR_DEBUG(x)                                              \
+    x(GENERAL)		x(IO)		x(MMIO)		x(INTERRUPT)    \
+    x(RX)		x(TX)		x(MDIC)		x(EEPROM)       \
+    x(UNKNOWN)		x(TXSUM)	x(TXERR)	x(RXERR)        \
+    x(RXFILTER)		x(PHY)		x(NOTYET)
+
 enum {
-    DEBUG_GENERAL,	DEBUG_IO,	DEBUG_MMIO,	DEBUG_INTERRUPT,
-    DEBUG_RX,		DEBUG_TX,	DEBUG_MDIC,	DEBUG_EEPROM,
-    DEBUG_UNKNOWN,	DEBUG_TXSUM,	DEBUG_TXERR,	DEBUG_RXERR,
-    DEBUG_RXFILTER,     DEBUG_PHY,      DEBUG_NOTYET,
+#define E1000_DEBUG_ENUM(name) DEBUG_##name,
+    E1000_FOR_DEBUG(E1000_DEBUG_ENUM)
+#undef E1000_DEBUG_ENUM
+};
+static const char *debugnames[] = {
+#define E1000_DEBUG_NAME(name) #name,
+    E1000_FOR_DEBUG(E1000_DEBUG_NAME)
+    NULL
+#undef E1000_DEBUG_NAME
 };
 #define DBGBIT(x)	(1<<DEBUG_##x)
 static int debugflags = DBGBIT(TXERR) | DBGBIT(GENERAL);
@@ -1691,3 +1703,51 @@ static void e1000_register_types(void)
 }
 
 type_init(e1000_register_types)
+
+#ifdef E1000_DEBUG
+static void e1000_init_debug(void)
+{
+    const char *e1000_debug;
+    const char *p, *p1;
+    const char **debugname;
+    int i;
+
+    e1000_debug = getenv("E1000_DEBUG");
+    if (!e1000_debug || !*e1000_debug)
+        return;
+
+    if (strcmp(e1000_debug, "?") == 0) {
+        error_printf("E1000_DEBUG flags:\n");
+        for (debugname = debugnames; *debugname; debugname++) {
+            error_printf("%s\n", *debugname);
+        }
+        exit(0);
+    }
+
+    p = e1000_debug;
+    debugflags = 0;
+    for (p = e1000_debug; ; p = p1 + 1) {
+        p1 = strchr(p, ',');
+        if (!p1)
+            p1 = p + strlen(p);
+        for (i = 0, debugname = debugnames; *debugname; i++, debugname++) {
+            if (strlen(*debugname) == p1 - p &&
+                strncasecmp(p, *debugname, p1 - p) == 0) {
+                debugflags |= 1<<i;
+                break;
+            }
+        }
+        if (!*debugname) {
+            qerror_report(QERR_INVALID_PARAMETER_VALUE, "E1000_DEBUG",
+                          "a comma-separated list of E1000 debug flags");
+            error_printf_unless_qmp(
+                "Try with argument '?' for a list.\n");
+            exit(1);
+        }
+        if (*p1 != ',')
+            break;
+    }
+}
+
+type_init(e1000_init_debug)
+#endif
