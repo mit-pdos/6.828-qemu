@@ -2541,6 +2541,7 @@ static const QEMUOption *lookup_opt(int argc, char **argv,
     return popt;
 }
 
+__attribute__((unused))
 static gpointer malloc_and_trace(gsize n_bytes)
 {
     void *ptr = malloc(n_bytes);
@@ -2548,6 +2549,7 @@ static gpointer malloc_and_trace(gsize n_bytes)
     return ptr;
 }
 
+__attribute__((unused))
 static gpointer realloc_and_trace(gpointer mem, gsize n_bytes)
 {
     void *ptr = realloc(mem, n_bytes);
@@ -2555,6 +2557,7 @@ static gpointer realloc_and_trace(gpointer mem, gsize n_bytes)
     return ptr;
 }
 
+__attribute__((unused))
 static void free_and_trace(gpointer mem)
 {
     trace_g_free(mem);
