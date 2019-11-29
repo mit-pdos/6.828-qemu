@@ -29,6 +29,10 @@
 #include "qemu/queue.h"
 #include "qemu/host-utils.h"
 
+#ifdef CONFIG_SYSMACROS
+#include <sys/sysmacros.h>
+#endif
+
 #ifndef CONFIG_HAS_ENVIRON
 #ifdef __APPLE__
 #include <crt_externs.h>
