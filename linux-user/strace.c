@@ -4,6 +4,7 @@
 #include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/select.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/mount.h>
 #include <sys/mman.h>
